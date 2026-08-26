@@ -136,6 +136,19 @@ Custom MCP tools only run in Pebble's **double-click** recording mode
 (single-click uses Pebble's own built-in actions). Make sure this server is
 assigned to whichever sandbox group your double-click uses.
 
+## How family member tagging works
+
+Family members aren't configured in this server at all — `create_event`
+calls `GET /frames/{id}/categories` on your real Skylight account (cached in
+memory per process) and matches the `who` argument against those labels,
+case-insensitively. "me"/"myself"/"i" resolve to `SKYLIGHT_DEFAULT_MEMBER`.
+If an exact match fails, it falls back to a fuzzy match (`difflib`) against
+the same labels, since Pebble's speech-to-text can mangle less common names
+(e.g. "Metree" or "May Tree" both still resolve to "Maitree" — verified
+live). Names that still don't match anything don't block the event — it's
+created without a profile tag, and the confirmation says so, so a mis-hearing
+is visible instead of silently wrong.
+
 ## Example phrases to try
 
 Each exercises a different part of the tool — after saying one (double-click

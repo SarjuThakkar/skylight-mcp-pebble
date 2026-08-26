@@ -31,6 +31,7 @@ Auth, live-verified 2026-08-26 against a real account:
 """
 
 import base64
+import difflib
 import logging
 import os
 import re
@@ -233,7 +234,10 @@ async def _resolve_who(who: str) -> tuple[list[str], list[str]]:
     """Split a free-text name list and match each against known categories.
 
     "me"/"myself"/"i" resolve to SKYLIGHT_DEFAULT_MEMBER (the server owner),
-    if set. Returns (matched_category_ids, unmatched_names).
+    if set. An exact case-insensitive match is tried first; if that fails,
+    falls back to a fuzzy match against known category labels, since
+    Pebble's speech-to-text can mangle less common names (e.g. "Metree" ->
+    "Maitree"). Returns (matched_category_ids, unmatched_names).
     """
     names = [n.strip() for n in re.split(r",|&|\band\b", who, flags=re.IGNORECASE) if n.strip()]
     mapping = await _category_map()
@@ -244,6 +248,11 @@ async def _resolve_who(who: str) -> tuple[list[str], list[str]]:
         else:
             key = name.lower()
         cat_id = mapping.get(key)
+        if not cat_id:
+            close = difflib.get_close_matches(key, mapping.keys(), n=1, cutoff=0.6)
+            if close:
+                logger.info("create_event: fuzzy-matched who %r -> %r", name, close[0])
+                cat_id = mapping[close[0]]
         if cat_id:
             matched.append(cat_id)
         else:
