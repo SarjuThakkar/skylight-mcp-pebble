@@ -397,6 +397,423 @@ create_event.__doc__ = create_event.__doc__.format(tz=str(LOCAL_TZ))
 mcp.tool()(create_event)
 
 
+# ---------------------------------------------------------------------------
+# Lists, chores, rewards and meals
+#
+# Endpoint shapes below were confirmed against a real frame. Three of them are
+# not guessable and cost real time to find:
+#
+#   * `meals` is a namespace, not a collection -- everything hangs off
+#     /meals/recipes, /meals/sittings. A flat /meals is a 404.
+#   * Chores are date-ranged like events; a bare GET is 422 "after can't be
+#     blank".
+#   * List items live under their parent list as `list_items`, not `items`.
+# ---------------------------------------------------------------------------
+
+def _flat(item: dict) -> dict:
+    """JSON:API record -> plain dict of attributes plus its id."""
+    out = dict(item.get("attributes") or {})
+    out["id"] = item.get("id")
+    return out
+
+
+def _pick(spoken: str, options: dict[str, str], what: str) -> str:
+    """Match spoken text against {label: id}, fuzzily. Raises if no match."""
+    key = re.sub(r"^(the|my|our)\s+", "", spoken.lower().strip())
+    if key in options:
+        return options[key]
+    close = difflib.get_close_matches(key, options.keys(), n=1, cutoff=0.6)
+    if close:
+        logger.info("fuzzy-matched %s %r -> %r", what, spoken, close[0])
+        return options[close[0]]
+    raise SkylightError(
+        f"I don't have a {what} called '{spoken.strip()}'. "
+        f"There's: {', '.join(sorted(options))}."
+    )
+
+
+async def _lists() -> list[dict]:
+    data = await _request("GET", f"/frames/{FRAME_ID}/lists")
+    return [_flat(i) for i in data.get("data", [])]
+
+
+async def _resolve_list(name: str) -> dict:
+    """Pick a list by spoken name.
+
+    With no name, prefer the grocery list -- "add milk" almost always means
+    the shopping list, and the frame flags exactly one as the default.
+    """
+    lists = await _lists()
+    if not lists:
+        raise SkylightError("There aren't any lists on the frame yet.")
+    if not name.strip():
+        for lst in lists:
+            if lst.get("default_grocery_list"):
+                return lst
+        return lists[0]
+    by_label = {l["label"].lower(): l["id"] for l in lists if l.get("label")}
+    chosen = _pick(name, by_label, "list")
+    return next(l for l in lists if l["id"] == chosen)
+
+
+@mcp.tool
+async def list_lists() -> str:
+    """List the shopping and to-do lists on the Skylight frame.
+
+    Use this when the user asks what lists exist, or before adding to one if
+    you're unsure of the exact name.
+    """
+    logger.info("list_lists: called")
+    try:
+        lists = await _lists()
+    except SkylightError as err:
+        return str(err)
+    if not lists:
+        return "There aren't any lists on the frame yet."
+    parts = []
+    for lst in lists:
+        label = lst.get("label", "untitled")
+        parts.append(f"{label} (grocery)" if lst.get("default_grocery_list") else label)
+    return "Lists: " + ", ".join(parts) + "."
+
+
+@mcp.tool
+async def show_list(name: str = "") -> str:
+    """Read back what's on a list.
+
+    Args:
+        name: Which list, as the user said it. Leave empty for the grocery list.
+    """
+    logger.info("show_list: name=%r", name)
+    try:
+        lst = await _resolve_list(name)
+        data = await _request(
+            "GET", f"/frames/{FRAME_ID}/lists/{lst['id']}/list_items"
+        )
+    except SkylightError as err:
+        return str(err)
+    items = [_flat(i) for i in data.get("data", [])]
+    open_items = [i["label"] for i in items if i.get("status") != "complete" and i.get("label")]
+    if not open_items:
+        return f"The {lst.get('label')} is empty."
+    return (
+        f"{lst.get('label')} ({len(open_items)}): " + ", ".join(open_items) + "."
+    )
+
+
+@mcp.tool
+async def add_to_list(items: str, name: str = "") -> str:
+    """Add one or more items to a list.
+
+    Args:
+        items: What to add, as the user said it. Several at once is fine --
+            "milk, eggs and bread" adds three separate items.
+        name: Which list. Leave empty for the grocery list, which is what
+            "add milk" almost always means.
+    """
+    logger.info("add_to_list: items=%r name=%r", items, name)
+    wanted = [i.strip() for i in re.split(r",|&|\band\b", items, flags=re.IGNORECASE) if i.strip()]
+    if not wanted:
+        return "What should I add?"
+    try:
+        lst = await _resolve_list(name)
+        for label in wanted:
+            await _request(
+                "POST", f"/frames/{FRAME_ID}/lists/{lst['id']}/list_items",
+                json={"label": label},
+            )
+    except SkylightError as err:
+        return str(err)
+    return f"Added {', '.join(wanted)} to the {lst.get('label')}."
+
+
+@mcp.tool
+async def check_off_list_item(item: str, name: str = "") -> str:
+    """Mark an item on a list as done.
+
+    Args:
+        item: Which item, as the user said it.
+        name: Which list. Leave empty for the grocery list.
+    """
+    logger.info("check_off_list_item: item=%r name=%r", item, name)
+    try:
+        lst = await _resolve_list(name)
+        data = await _request(
+            "GET", f"/frames/{FRAME_ID}/lists/{lst['id']}/list_items"
+        )
+        rows = [_flat(i) for i in data.get("data", [])]
+        open_rows = {
+            r["label"].lower(): r["id"]
+            for r in rows if r.get("label") and r.get("status") != "complete"
+        }
+        if not open_rows:
+            return f"Nothing left open on the {lst.get('label')}."
+        item_id = _pick(item, open_rows, f"item on the {lst.get('label')}")
+        await _request(
+            "PATCH", f"/frames/{FRAME_ID}/lists/{lst['id']}/list_items/{item_id}",
+            json={"status": "complete"},
+        )
+    except SkylightError as err:
+        return str(err)
+    return f"Checked off {item.strip()}."
+
+
+@mcp.tool
+async def create_list(name: str, kind: str = "to_do") -> str:
+    """Create a new list on the frame.
+
+    Args:
+        name: What to call it.
+        kind: "shopping" for a grocery-style list, "to_do" for a checklist,
+            or "other". Defaults to "to_do".
+    """
+    logger.info("create_list: name=%r kind=%r", name, kind)
+    kinds = {"shopping", "to_do", "other"}
+    key = _norm_kind(kind)
+    if key not in kinds:
+        return f"I can make a shopping, to-do or other list -- not '{kind}'."
+    try:
+        await _request(
+            "POST", f"/frames/{FRAME_ID}/lists",
+            json={"label": name.strip(), "kind": key},
+        )
+    except SkylightError as err:
+        return str(err)
+    return f"Created the {name.strip()} list."
+
+
+def _norm_kind(kind: str) -> str:
+    k = re.sub(r"[^a-z]", "", kind.lower())
+    if k in {"shopping", "grocery", "groceries", "store"}:
+        return "shopping"
+    if k in {"todo", "tasks", "task", "checklist"}:
+        return "to_do"
+    return k or "to_do"
+
+
+@mcp.tool
+async def list_chores(who: str = "", days: int = 1) -> str:
+    """Report chores that still need doing.
+
+    Args:
+        who: Whose chores, e.g. "Sarju". Leave empty for everyone's.
+        days: How many days ahead to look. Defaults to today only.
+    """
+    logger.info("list_chores: who=%r days=%r", who, days)
+    start = datetime.now(LOCAL_TZ).replace(hour=0, minute=0, second=0, microsecond=0)
+    end = start + timedelta(days=max(1, days))
+    try:
+        data = await _request(
+            "GET",
+            f"/frames/{FRAME_ID}/chores"
+            f"?after={_to_utc_z(start)}&before={_to_utc_z(end)}",
+        )
+        rows = data.get("data", [])
+        wanted_ids: list[str] = []
+        if who.strip():
+            wanted_ids, unmatched = await _resolve_who(who)
+            if unmatched:
+                return f"I don't know who {', '.join(unmatched)} is."
+        names = {v: k for k, v in (await _category_map()).items()}
+    except SkylightError as err:
+        return str(err)
+
+    pending = []
+    for row in rows:
+        a = _flat(row)
+        if a.get("status") == "complete":
+            continue
+        cat = ((row.get("relationships", {}).get("category") or {}).get("data") or {})
+        cat_id = cat.get("id")
+        if wanted_ids and cat_id not in wanted_ids:
+            continue
+        owner = names.get(cat_id, "").title()
+        pending.append(f"{a.get('summary')}" + (f" ({owner})" if owner and not who.strip() else ""))
+
+    if not pending:
+        return "Nothing outstanding." if not who.strip() else f"Nothing outstanding for {who.strip()}."
+    return f"{len(pending)} to do: " + ", ".join(pending) + "."
+
+
+@mcp.tool
+async def complete_chore(chore: str, who: str = "") -> str:
+    """Mark a chore done.
+
+    Args:
+        chore: Which chore, as the user said it, e.g. "workout".
+        who: Only needed for a chore that's up for grabs rather than assigned
+            to someone. Leave empty otherwise.
+
+    IMPORTANT: if the result says the chore wasn't found, relay the list of
+    real chore names rather than guessing at a different one.
+    """
+    logger.info("complete_chore: chore=%r who=%r", chore, who)
+    start = datetime.now(LOCAL_TZ).replace(hour=0, minute=0, second=0, microsecond=0)
+    end = start + timedelta(days=1)
+    try:
+        data = await _request(
+            "GET",
+            f"/frames/{FRAME_ID}/chores"
+            f"?after={_to_utc_z(start)}&before={_to_utc_z(end)}",
+        )
+        rows = [_flat(r) for r in data.get("data", [])]
+        open_rows = {
+            r["summary"].lower(): r
+            for r in rows if r.get("summary") and r.get("status") != "complete"
+        }
+        if not open_rows:
+            return "Nothing's outstanding today."
+        picked_id = _pick(chore, {k: v["id"] for k, v in open_rows.items()}, "chore")
+        row = next(r for r in open_rows.values() if r["id"] == picked_id)
+
+        # The completion goes against the *series*, with the occurrence named
+        # separately -- posting the occurrence id would complete the whole
+        # recurring series instead of today's instance.
+        body: dict = {"status": "complete", "instance_date": row.get("start")}
+        if row.get("start_time"):
+            body["instance_time"] = row["start_time"]
+        # category_id is only accepted for an up-for-grabs chore; sending it
+        # for a normally assigned one is a 422.
+        if who.strip() and row.get("up_for_grabs"):
+            matched, unmatched = await _resolve_who(who)
+            if unmatched:
+                return f"I don't know who {', '.join(unmatched)} is."
+            body["category_id"] = matched[0]
+
+        await _request(
+            "PUT", f"/frames/{FRAME_ID}/chores/{row.get('series') or row['id']}/completions",
+            json=body,
+        )
+    except SkylightError as err:
+        return str(err)
+    points = row.get("reward_points")
+    earned = f" That's {points} point{'s' if points != 1 else ''}." if points else ""
+    return f"Marked {row.get('summary')} done.{earned}"
+
+
+@mcp.tool
+async def list_rewards() -> str:
+    """List the rewards that can be redeemed, and what they cost."""
+    logger.info("list_rewards: called")
+    try:
+        data = await _request("GET", f"/frames/{FRAME_ID}/rewards")
+    except SkylightError as err:
+        return str(err)
+    rows = [_flat(r) for r in data.get("data", [])]
+    available = [r for r in rows if not r.get("redeemed_at")]
+    if not available:
+        return "There aren't any rewards available right now."
+    parts = [f"{r.get('name')} for {r.get('point_value')} points" for r in available]
+    return "Rewards: " + ", ".join(parts) + "."
+
+
+@mcp.tool
+async def redeem_reward(reward: str) -> str:
+    """Redeem a reward.
+
+    Args:
+        reward: Which reward, as the user said it, e.g. "massage".
+    """
+    logger.info("redeem_reward: reward=%r", reward)
+    try:
+        data = await _request("GET", f"/frames/{FRAME_ID}/rewards")
+        rows = [_flat(r) for r in data.get("data", [])]
+        options = {
+            r["name"].lower(): r["id"]
+            for r in rows if r.get("name") and not r.get("redeemed_at")
+        }
+        if not options:
+            return "There aren't any rewards available to redeem."
+        reward_id = _pick(reward, options, "reward")
+        row = next(r for r in rows if r["id"] == reward_id)
+        await _request(
+            "PATCH", f"/frames/{FRAME_ID}/rewards/{reward_id}",
+            json={"redeemed_at": _to_utc_z(datetime.now(timezone.utc))},
+        )
+    except SkylightError as err:
+        return str(err)
+    return f"Redeemed {row.get('name')} for {row.get('point_value')} points."
+
+
+@mcp.tool
+async def list_recipes(search: str = "") -> str:
+    """List saved recipes on the frame.
+
+    Args:
+        search: Optional text to filter by, e.g. "chicken".
+    """
+    logger.info("list_recipes: search=%r", search)
+    try:
+        data = await _request("GET", f"/frames/{FRAME_ID}/meals/recipes")
+    except SkylightError as err:
+        return str(err)
+    rows = [_flat(r) for r in data.get("data", [])]
+    names = [r["summary"] for r in rows if r.get("summary")]
+    if search.strip():
+        needle = search.lower().strip()
+        names = [n for n in names if needle in n.lower()]
+        if not names:
+            return f"No saved recipes match '{search.strip()}'."
+    if not names:
+        return "There aren't any saved recipes yet."
+    # A voice reply listing 69 recipes is useless, so cap it and say so.
+    shown = names[:20]
+    more = f" and {len(names) - len(shown)} more" if len(names) > len(shown) else ""
+    return f"{len(names)} recipes: " + ", ".join(shown) + more + "."
+
+
+@mcp.tool
+async def show_meal_plan(days: int = 7) -> str:
+    """Report what meals are planned.
+
+    Args:
+        days: How many days ahead to look. Defaults to a week.
+    """
+    logger.info("show_meal_plan: days=%r", days)
+    start = datetime.now(LOCAL_TZ).date()
+    try:
+        data = await _request(
+            "GET",
+            f"/frames/{FRAME_ID}/meals/sittings?date_min={start.isoformat()}"
+            f"&date_max={(start + timedelta(days=max(1, days))).isoformat()}",
+        )
+    except SkylightError as err:
+        return str(err)
+    rows = [_flat(r) for r in data.get("data", [])]
+    if not rows:
+        return "Nothing's planned for the next few days."
+    parts = []
+    for r in rows:
+        when = r.get("date") or r.get("start") or ""
+        what = r.get("summary") or r.get("label") or "something"
+        parts.append(f"{what} on {when}" if when else what)
+    return "Planned: " + "; ".join(parts) + "."
+
+
+@mcp.tool
+async def add_recipe_to_grocery_list(recipe: str) -> str:
+    """Add a saved recipe's ingredients to the grocery list.
+
+    Args:
+        recipe: Which recipe, as the user said it.
+    """
+    logger.info("add_recipe_to_grocery_list: recipe=%r", recipe)
+    try:
+        data = await _request("GET", f"/frames/{FRAME_ID}/meals/recipes")
+        rows = [_flat(r) for r in data.get("data", [])]
+        options = {r["summary"].lower(): r["id"] for r in rows if r.get("summary")}
+        recipe_id = _pick(recipe, options, "recipe")
+        row = next(r for r in rows if r["id"] == recipe_id)
+        await _request(
+            "POST",
+            f"/frames/{FRAME_ID}/meals/recipes/{recipe_id}/add_to_grocery_list",
+            json={},
+        )
+    except SkylightError as err:
+        return str(err)
+    return f"Added the ingredients for {row.get('summary')} to the grocery list."
+
+
 async def healthz(request: Request) -> JSONResponse:
     return JSONResponse({"status": "ok"})
 
