@@ -458,7 +458,11 @@ async def _resolve_list(name: str) -> dict:
 
 @mcp.tool
 async def list_lists() -> str:
-    """List the shopping and to-do lists on the Skylight frame.
+    """List the household shopping and to-do lists on the Skylight frame.
+
+    HOUSEHOLD LISTS ONLY -- groceries, errands, chores, ideas. Books are not
+    here: a reading list or book list lives on Goodreads, so use the Goodreads
+    tools for those.
 
     Use this when the user asks what lists exist, or before adding to one if
     you're unsure of the exact name.
@@ -479,7 +483,10 @@ async def list_lists() -> str:
 
 @mcp.tool
 async def show_list(name: str = "") -> str:
-    """Read back what's on a list.
+    """Read back what's on a household list.
+
+    HOUSEHOLD LISTS ONLY. For "what am I reading" or a to-read list, use the
+    Goodreads tools instead.
 
     Args:
         name: Which list, as the user said it. Leave empty for the grocery list.
@@ -503,7 +510,11 @@ async def show_list(name: str = "") -> str:
 
 @mcp.tool
 async def add_to_list(items: str, name: str = "") -> str:
-    """Add one or more items to a list.
+    """Add one or more items to a household list.
+
+    HOUSEHOLD LISTS ONLY -- groceries, errands, to-dos. If the user is adding
+    a BOOK ("add Project Hail Mary to my reading list"), that belongs on a
+    Goodreads shelf, not here: use the Goodreads tools.
 
     Args:
         items: What to add, as the user said it. Several at once is fine --
@@ -560,7 +571,10 @@ async def check_off_list_item(item: str, name: str = "") -> str:
 
 @mcp.tool
 async def create_list(name: str, kind: str = "to_do") -> str:
-    """Create a new list on the frame.
+    """Create a new household list on the frame.
+
+    HOUSEHOLD LISTS ONLY -- a shopping list, a to-do list. Reading lists live
+    on Goodreads.
 
     Args:
         name: What to call it.
