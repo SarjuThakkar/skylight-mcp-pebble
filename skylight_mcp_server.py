@@ -735,31 +735,74 @@ async def redeem_reward(reward: str) -> str:
     return f"Redeemed {row.get('name')} for {row.get('point_value')} points."
 
 
+_WEEKDAYS = {
+    "monday": 0, "tuesday": 1, "wednesday": 2, "thursday": 3,
+    "friday": 4, "saturday": 5, "sunday": 6,
+}
+
+
+def _meal_date(when: str):
+    """Turn "friday" / "tomorrow" / "2026-09-04" into a date.
+
+    A bare weekday means the next one coming up, not today's, since "put
+    tacos on Friday" said on a Friday almost always means next week.
+    """
+    today = datetime.now(LOCAL_TZ).date()
+    key = re.sub(r"^(on|this|next)\s+", "", when.lower().strip())
+    if not key or key == "today":
+        return today
+    if key == "tomorrow":
+        return today + timedelta(days=1)
+    if _DATE_ONLY_RE.match(key):
+        return datetime.fromisoformat(key).date()
+    if key in _WEEKDAYS:
+        ahead = (_WEEKDAYS[key] - today.weekday()) % 7
+        return today + timedelta(days=ahead or 7)
+    raise SkylightError(
+        f"I couldn't work out when '{when.strip()}' is. Try a day name, "
+        "'tomorrow', or a date like 2026-09-04."
+    )
+
+
 @mcp.tool
-async def list_recipes(search: str = "") -> str:
-    """List saved recipes on the frame.
+async def add_to_meal_plan(meal: str, when: str = "", meal_type: str = "") -> str:
+    """Put a meal on the meal plan.
 
     Args:
-        search: Optional text to filter by, e.g. "chicken".
+        meal: What's being eaten, as the user said it, e.g. "tacos". Free
+            text -- it doesn't have to be a saved recipe.
+        when: Which day, e.g. "friday", "tomorrow", or "2026-09-04".
+            Defaults to today.
+        meal_type: Breakfast, lunch or dinner. Defaults to dinner.
     """
-    logger.info("list_recipes: search=%r", search)
+    logger.info("add_to_meal_plan: meal=%r when=%r meal_type=%r", meal, when, meal_type)
+    if not meal.strip():
+        return "What should I add to the meal plan?"
     try:
-        data = await _request("GET", f"/frames/{FRAME_ID}/meals/recipes")
+        day = _meal_date(when)
+        data = await _request("GET", f"/frames/{FRAME_ID}/meals/categories")
+        cats = [_flat(c) for c in data.get("data", [])]
+        enabled = {c["label"].lower(): c["id"] for c in cats
+                   if c.get("label") and c.get("enabled")}
+        if not enabled:
+            return "The frame doesn't have any meal categories set up."
+        wanted = meal_type.strip() or "dinner"
+        cat_id = _pick(wanted, enabled, "meal type")
+        label = next(c["label"] for c in cats if c["id"] == cat_id)
+        await _request(
+            "POST", f"/frames/{FRAME_ID}/meals/sittings",
+            json={
+                "meal_category_id": cat_id,
+                "date": day.isoformat(),
+                # Free text, deliberately: no recipe is linked, so summary
+                # carries the name. Sending both a summary and a recipe id
+                # is a 422 -- the sitting takes its name from the recipe.
+                "summary": meal.strip(),
+            },
+        )
     except SkylightError as err:
         return str(err)
-    rows = [_flat(r) for r in data.get("data", [])]
-    names = [r["summary"] for r in rows if r.get("summary")]
-    if search.strip():
-        needle = search.lower().strip()
-        names = [n for n in names if needle in n.lower()]
-        if not names:
-            return f"No saved recipes match '{search.strip()}'."
-    if not names:
-        return "There aren't any saved recipes yet."
-    # A voice reply listing 69 recipes is useless, so cap it and say so.
-    shown = names[:20]
-    more = f" and {len(names) - len(shown)} more" if len(names) > len(shown) else ""
-    return f"{len(names)} recipes: " + ", ".join(shown) + more + "."
+    return f"Put {meal.strip()} on the plan for {label.lower()} on {day:%A}."
 
 
 @mcp.tool
@@ -788,30 +831,6 @@ async def show_meal_plan(days: int = 7) -> str:
         what = r.get("summary") or r.get("label") or "something"
         parts.append(f"{what} on {when}" if when else what)
     return "Planned: " + "; ".join(parts) + "."
-
-
-@mcp.tool
-async def add_recipe_to_grocery_list(recipe: str) -> str:
-    """Add a saved recipe's ingredients to the grocery list.
-
-    Args:
-        recipe: Which recipe, as the user said it.
-    """
-    logger.info("add_recipe_to_grocery_list: recipe=%r", recipe)
-    try:
-        data = await _request("GET", f"/frames/{FRAME_ID}/meals/recipes")
-        rows = [_flat(r) for r in data.get("data", [])]
-        options = {r["summary"].lower(): r["id"] for r in rows if r.get("summary")}
-        recipe_id = _pick(recipe, options, "recipe")
-        row = next(r for r in rows if r["id"] == recipe_id)
-        await _request(
-            "POST",
-            f"/frames/{FRAME_ID}/meals/recipes/{recipe_id}/add_to_grocery_list",
-            json={},
-        )
-    except SkylightError as err:
-        return str(err)
-    return f"Added the ingredients for {row.get('summary')} to the grocery list."
 
 
 async def healthz(request: Request) -> JSONResponse:
