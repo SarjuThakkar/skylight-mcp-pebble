@@ -777,6 +777,34 @@ async def list_lists() -> str:
     return "Lists: " + ", ".join(parts) + "."
 
 
+def _group_by_section(rows: list[dict]) -> list[tuple[str, list[str]]]:
+    """Open item labels grouped by their `section`, ungrouped ones first.
+
+    `section` is a plain string attribute on each list item -- not a separate
+    resource -- and is null unless something sets it. Items sharing a section
+    name are drawn as one group on the frame, so read them back the same way.
+
+    `position` is numbered per section rather than across the whole list, so
+    sort inside each group and never across them. Returns (section, labels)
+    pairs with "" as the section for ungrouped items.
+    """
+    order: list[str] = []
+    groups: dict[str, list[dict]] = {}
+    for row in rows:
+        if row.get("status") == "complete" or not row.get("label"):
+            continue
+        section = (row.get("section") or "").strip()
+        if section not in groups:
+            order.append(section)
+            groups[section] = []
+        groups[section].append(row)
+    order.sort(key=lambda s: (s != "", s.lower()))
+    return [
+        (s, [r["label"] for r in sorted(groups[s], key=lambda r: r.get("position") or 0)])
+        for s in order
+    ]
+
+
 @mcp.tool
 async def show_list(name: str = "") -> str:
     """Read back what's on a household list.
@@ -795,13 +823,22 @@ async def show_list(name: str = "") -> str:
         )
     except SkylightError as err:
         return str(err)
-    items = [_flat(i) for i in data.get("data", [])]
-    open_items = [i["label"] for i in items if i.get("status") != "complete" and i.get("label")]
-    if not open_items:
+    groups = _group_by_section([_flat(i) for i in data.get("data", [])])
+    total = sum(len(labels) for _, labels in groups)
+    if not total:
         return f"The {lst.get('label')} is empty."
-    return (
-        f"{lst.get('label')} ({len(open_items)}): " + ", ".join(open_items) + "."
-    )
+    header = f"{lst.get('label')} ({total})"
+    chunks = []
+    for section, labels in groups:
+        listed = ", ".join(labels)
+        # Ungrouped items hang straight off the header rather than being
+        # announced under a made-up label like "no section" -- read aloud,
+        # "To-Do List (5): Return Revolve. Low Priority: ..." is the whole
+        # list in the order the frame shows it.
+        chunks.append(listed if not section else f"{section}: {listed}")
+    if groups[0][0]:
+        return f"{header}. " + ". ".join(chunks) + "."
+    return f"{header}: " + ". ".join(chunks) + "."
 
 
 # How many words either side of an "and" may have before we stop believing it
@@ -845,7 +882,7 @@ def _split_items(text: str) -> list[str]:
 
 
 @mcp.tool
-async def add_to_list(items: str, name: str = "") -> str:
+async def add_to_list(items: str, name: str = "", section: str = "") -> str:
     """Add one or more items to a household list.
 
     HOUSEHOLD LISTS ONLY -- groceries, errands, to-dos. If the user is adding
@@ -859,21 +896,29 @@ async def add_to_list(items: str, name: str = "") -> str:
             like "a physical and mental therapist" stays one item.
         name: Which list. Leave empty for the grocery list, which is what
             "add milk" almost always means.
+        section: Optional heading to file them under, e.g. "Low Priority".
+            Items sharing a section name group together on the frame; leave
+            empty and they sit ungrouped at the top of the list.
     """
-    logger.info("add_to_list: items=%r name=%r", items, name)
+    logger.info("add_to_list: items=%r name=%r section=%r", items, name, section)
     wanted = _split_items(items)
     if not wanted:
         return "What should I add?"
+    heading = section.strip()
     try:
         lst = await _resolve_list(name)
         for label in wanted:
+            body = {"label": label}
+            if heading:
+                body["section"] = heading
             await _request(
                 "POST", f"/frames/{FRAME_ID}/lists/{lst['id']}/list_items",
-                json={"label": label},
+                json=body,
             )
     except SkylightError as err:
         return str(err)
-    return f"Added {', '.join(wanted)} to the {lst.get('label')}."
+    where = f"{heading} on the {lst.get('label')}" if heading else f"the {lst.get('label')}"
+    return f"Added {', '.join(wanted)} to {where}."
 
 
 @mcp.tool
@@ -943,6 +988,52 @@ async def delete_list_item(item: str, name: str = "") -> str:
     except SkylightError as err:
         return str(err)
     return f"Deleted {label} from the {lst.get('label')}."
+
+
+@mcp.tool
+async def set_list_item_section(item: str, section: str, name: str = "") -> str:
+    """File an item already on a list under a section heading, or unfile it.
+
+    HOUSEHOLD LISTS ONLY. Sections are just a string tag shared between items
+    -- there's nothing to create first, so any heading works and matching ones
+    group together on the frame.
+
+    Args:
+        item: Which item, as the user said it.
+        section: The heading to move it under, e.g. "Low Priority". Empty
+            clears it back to ungrouped.
+        name: Which list. Leave empty for the grocery list.
+    """
+    logger.info("set_list_item_section: item=%r section=%r name=%r", item, section, name)
+    heading = section.strip()
+    try:
+        lst = await _resolve_list(name)
+        data = await _request(
+            "GET", f"/frames/{FRAME_ID}/lists/{lst['id']}/list_items"
+        )
+        rows = [_flat(i) for i in data.get("data", [])]
+        open_rows = {
+            r["label"].lower(): r["id"]
+            for r in rows if r.get("label") and r.get("status") != "complete"
+        }
+        if not open_rows:
+            return f"Nothing left open on the {lst.get('label')}."
+        item_id = _pick(item, open_rows, f"item on the {lst.get('label')}")
+        label = next(
+            (r["label"] for r in rows if r["id"] == item_id), item.strip()
+        )
+        # Clearing sends null, not "" -- both are accepted, but an empty
+        # string is stored literally and reads back as a nameless section
+        # rather than as ungrouped.
+        await _request(
+            "PATCH", f"/frames/{FRAME_ID}/lists/{lst['id']}/list_items/{item_id}",
+            json={"section": heading or None},
+        )
+    except SkylightError as err:
+        return str(err)
+    if not heading:
+        return f"Took {label} out of its section on the {lst.get('label')}."
+    return f"Moved {label} to {heading} on the {lst.get('label')}."
 
 
 # The frame requires a colour on every list -- a create without one comes back
