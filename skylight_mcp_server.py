@@ -887,31 +887,98 @@ async def complete_chore(chore: str, who: str = "") -> str:
     return f"Marked {summary} done{owner} for today.{earned}"
 
 
+async def _point_balances() -> dict[str, int]:
+    """category id -> current point balance.
+
+    Points are per family member and live nowhere near the categories
+    themselves, which carry no balance at all.
+    """
+    data = await _request("GET", f"/frames/{FRAME_ID}/reward_points")
+    rows = data if isinstance(data, list) else data.get("data", [])
+    return {str(r["category_id"]): r.get("current_point_balance", 0) for r in rows}
+
+
+async def _one_person(who: str) -> tuple[str, str]:
+    """Resolve a single person to (category_id, display name).
+
+    Falls back to SKYLIGHT_DEFAULT_MEMBER, so "how many points do I have"
+    works without naming anyone.
+    """
+    wanted = who.strip() or DEFAULT_MEMBER
+    if not wanted:
+        raise SkylightError("Whose points do you mean?")
+    ids, unmatched = await _resolve_who(wanted)
+    if unmatched:
+        raise SkylightError(f"I don't know who {', '.join(unmatched)} is.")
+    if not ids:
+        raise SkylightError(f"I couldn't work out who '{who.strip()}' is.")
+    names = {v: k for k, v in (await _category_map()).items()}
+    return ids[0], names.get(ids[0], "").title()
+
+
 @mcp.tool
-async def list_rewards() -> str:
-    """List the rewards that can be redeemed, and what they cost."""
-    logger.info("list_rewards: called")
+async def list_rewards(who: str = "") -> str:
+    """List the rewards available and how many points someone has.
+
+    Use this for "what rewards are there", "how many points do I have", or
+    before redeeming, to check whether it's affordable.
+
+    Args:
+        who: Whose points to report, e.g. "Maitree". Says "me"/"my" or leave
+            empty for the default family member; "us" reports everyone.
+    """
+    logger.info("list_rewards: who=%r", who)
     try:
         data = await _request("GET", f"/frames/{FRAME_ID}/rewards")
+        balances = await _point_balances()
+        names = {v: k for k, v in (await _category_map()).items()}
+        wanted = who.strip() or DEFAULT_MEMBER
+        ids, unmatched = await _resolve_who(wanted) if wanted else ([], [])
+        if unmatched:
+            return f"I don't know who {', '.join(unmatched)} is."
     except SkylightError as err:
         return str(err)
+
     rows = [_flat(r) for r in data.get("data", [])]
     available = [r for r in rows if not r.get("redeemed_at")]
+
+    parts = []
+    for cat_id in (ids or balances.keys()):
+        label = names.get(cat_id, "").title() or "Someone"
+        parts.append(f"{label} has {balances.get(cat_id, 0)} points")
+    balance_line = "; ".join(parts) + "." if parts else ""
+
     if not available:
-        return "There aren't any rewards available right now."
-    parts = [f"{r.get('name')} for {r.get('point_value')} points" for r in available]
-    return "Rewards: " + ", ".join(parts) + "."
+        return (balance_line + " There aren't any rewards available right now.").strip()
+
+    # Say what's actually within reach, not just what exists -- "5 points"
+    # means nothing without knowing you have 5.
+    top = max((balances.get(c, 0) for c in (ids or balances.keys())), default=0)
+    listed = []
+    for r in available:
+        cost = r.get("point_value") or 0
+        afford = "" if cost <= top else " (not enough points yet)"
+        listed.append(f"{r.get('name')} for {cost}{afford}")
+    return f"{balance_line} Rewards: " + ", ".join(listed) + "."
 
 
 @mcp.tool
-async def redeem_reward(reward: str) -> str:
-    """Redeem a reward.
+async def redeem_reward(reward: str, who: str = "") -> str:
+    """Redeem a reward for someone, spending their points.
 
     Args:
         reward: Which reward, as the user said it, e.g. "massage".
+        who: Who's redeeming it. Says "me"/"my" or leave empty for the
+            default family member.
+
+    IMPORTANT: if the result says there aren't enough points, relay that
+    rather than redeeming something else.
     """
-    logger.info("redeem_reward: reward=%r", reward)
+    logger.info("redeem_reward: reward=%r who=%r", reward, who)
+    reward, implied = _split_owner(reward)
+    who = who.strip() or implied
     try:
+        cat_id, label = await _one_person(who)
         data = await _request("GET", f"/frames/{FRAME_ID}/rewards")
         rows = [_flat(r) for r in data.get("data", [])]
         options = {
@@ -922,41 +989,28 @@ async def redeem_reward(reward: str) -> str:
             return "There aren't any rewards available to redeem."
         reward_id = _pick(reward, options, "reward")
         row = next(r for r in rows if r["id"] == reward_id)
+
+        cost = row.get("point_value") or 0
+        balance = (await _point_balances()).get(cat_id, 0)
+        if balance < cost:
+            # Better to say so than to let Skylight reject it, or worse,
+            # accept it and quietly leave a negative balance.
+            return (
+                f"{label} has {balance} points and {row.get('name')} costs {cost} "
+                f"-- {cost - balance} short."
+            )
+
+        # POST .../redeem, not a PATCH of redeemed_at: the timestamp is a
+        # result of redeeming, not the thing that causes it.
         await _request(
-            "PATCH", f"/frames/{FRAME_ID}/rewards/{reward_id}",
-            json={"redeemed_at": _to_utc_z(datetime.now(timezone.utc))},
+            "POST", f"/frames/{FRAME_ID}/rewards/{reward_id}/redeem",
+            json={"category_id": cat_id},
         )
     except SkylightError as err:
         return str(err)
-    return f"Redeemed {row.get('name')} for {row.get('point_value')} points."
-
-
-_WEEKDAYS = {
-    "monday": 0, "tuesday": 1, "wednesday": 2, "thursday": 3,
-    "friday": 4, "saturday": 5, "sunday": 6,
-}
-
-
-def _meal_date(when: str):
-    """Turn "friday" / "tomorrow" / "2026-09-04" into a date.
-
-    A bare weekday means the next one coming up, not today's, since "put
-    tacos on Friday" said on a Friday almost always means next week.
-    """
-    today = datetime.now(LOCAL_TZ).date()
-    key = re.sub(r"^(on|this|next)\s+", "", when.lower().strip())
-    if not key or key == "today":
-        return today
-    if key == "tomorrow":
-        return today + timedelta(days=1)
-    if _DATE_ONLY_RE.match(key):
-        return datetime.fromisoformat(key).date()
-    if key in _WEEKDAYS:
-        ahead = (_WEEKDAYS[key] - today.weekday()) % 7
-        return today + timedelta(days=ahead or 7)
-    raise SkylightError(
-        f"I couldn't work out when '{when.strip()}' is. Try a day name, "
-        "'tomorrow', or a date like 2026-09-04."
+    return (
+        f"Redeemed {row.get('name')} for {label}. That's {cost} points, "
+        f"leaving {balance - cost}."
     )
 
 
