@@ -865,6 +865,31 @@ async def check_off_list_item(item: str, name: str = "") -> str:
     return f"Checked off {item.strip()}."
 
 
+# The frame requires a colour on every list -- a create without one comes back
+# 422 "Color can't be blank". Any hex string is accepted, so rotate through a
+# palette instead of stamping every new list the same shade. The first three
+# are the colours the frame already shipped with.
+LIST_COLORS = (
+    "#F63922",  # red
+    "#0F7170",  # teal
+    "#F9CD50",  # yellow
+    "#7B68EE",  # violet
+    "#2E7DD1",  # blue
+    "#E07B39",  # orange
+    "#3FA34D",  # green
+    "#C2497A",  # magenta
+)
+
+
+def _next_list_color(existing: list[dict]) -> str:
+    """A palette colour not already in use on the frame, else next in rotation."""
+    used = {str(l.get("color") or "").strip().upper() for l in existing}
+    for color in LIST_COLORS:
+        if color.upper() not in used:
+            return color
+    return LIST_COLORS[len(existing) % len(LIST_COLORS)]
+
+
 @mcp.tool
 async def create_list(name: str, kind: str = "to_do") -> str:
     """Create a new household list on the frame.
@@ -883,9 +908,17 @@ async def create_list(name: str, kind: str = "to_do") -> str:
     if key not in kinds:
         return f"I can make a shopping, to-do or other list -- not '{kind}'."
     try:
+        try:
+            existing = await _lists()
+        except SkylightError:
+            existing = []  # a colour still has to be sent; any is better than none
         await _request(
             "POST", f"/frames/{FRAME_ID}/lists",
-            json={"label": name.strip(), "kind": key},
+            json={
+                "label": name.strip(),
+                "kind": key,
+                "color": _next_list_color(existing),
+            },
         )
     except SkylightError as err:
         return str(err)
