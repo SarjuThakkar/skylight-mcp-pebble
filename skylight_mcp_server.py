@@ -43,6 +43,7 @@ import secrets
 import logging
 import os
 import re
+import time
 import uuid
 from datetime import datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
@@ -91,6 +92,11 @@ def _is_date_only(value: str) -> bool:
     return bool(_DATE_ONLY_RE.match(value.strip()))
 
 _access_token: str | None = None
+_refresh_token: str | None = None
+# Unix seconds. Skylight issues 24h access tokens alongside a refresh token.
+_token_expires_at: float = 0.0
+# Renew a little early rather than discovering expiry as a failed API call.
+_TOKEN_MARGIN = 300
 
 
 class SkylightError(RuntimeError):
@@ -201,13 +207,60 @@ async def _login() -> str:
         token = body.get("access_token")
         if not token:
             raise SkylightError("Skylight login step 4: no access_token in the response.")
+        _remember(body)
         return token
 
 
+def _remember(body: dict) -> None:
+    """Record the token, its refresh token, and when it expires."""
+    global _access_token, _refresh_token, _token_expires_at
+    _access_token = body.get("access_token")
+    _refresh_token = body.get("refresh_token") or _refresh_token
+    _token_expires_at = time.time() + float(body.get("expires_in", 86400))
+
+
+async def _refresh() -> str | None:
+    """Renew with the refresh token. Returns None if that isn't possible.
+
+    Preferred over a full re-login: it skips the password and the 4-step
+    authorization dance entirely -- and that dance is the fragile part, as
+    PKCE becoming mandatory demonstrated by breaking every login at once.
+    """
+    if not _refresh_token:
+        return None
+    async with httpx.AsyncClient(base_url=BASE, timeout=20) as client:
+        r = await client.post(
+            "/oauth/token",
+            data={
+                "grant_type": "refresh_token",
+                "client_id": CLIENT_ID,
+                "refresh_token": _refresh_token,
+            },
+            headers={"Content-Type": "application/x-www-form-urlencoded",
+                     "Accept": "application/json"},
+        )
+    if r.status_code != 200:
+        logger.info("refresh token rejected (%s), falling back to a full login",
+                    r.status_code)
+        return None
+    body = r.json()
+    if not body.get("access_token"):
+        return None
+    _remember(body)
+    logger.info("renewed the Skylight token without re-sending the password")
+    return _access_token
+
+
 async def _get_token() -> str:
+    """A valid access token, renewed as cheaply as possible."""
     global _access_token
-    if _access_token is None:
-        _access_token = await _login()
+    if _access_token and time.time() < _token_expires_at - _TOKEN_MARGIN:
+        return _access_token
+    if _refresh_token:
+        renewed = await _refresh()
+        if renewed:
+            return renewed
+    _access_token = await _login()
     return _access_token
 
 
@@ -223,7 +276,10 @@ async def _request(method: str, path: str, **kw) -> dict:
     async with httpx.AsyncClient(base_url=API, timeout=20) as client:
         r = await client.request(method, path, headers=headers, **kw)
         if r.status_code == 401:
+            # Force renewal on the next call; the refresh token gets first
+            # refusal, and a full login only if that is rejected too.
             _access_token = None
+            globals()["_token_expires_at"] = 0.0
             headers["Authorization"] = f"Bearer {await _get_token()}"
             r = await client.request(method, path, headers=headers, **kw)
         if r.status_code >= 400:
