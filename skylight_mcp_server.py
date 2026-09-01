@@ -774,7 +774,12 @@ async def list_chores(who: str = "", days: int = 1) -> str:
         pending.append(f"{a.get('summary')}" + (f" ({owner})" if owner and not who.strip() else ""))
 
     if not pending:
-        return "Nothing outstanding." if not who.strip() else f"Nothing outstanding for {who.strip()}."
+        if not who.strip():
+            return "Nothing outstanding."
+        # Echoing the raw input back gives "Nothing outstanding for me",
+        # which reads like the question wasn't understood.
+        said = ", ".join(sorted(names.get(i, "").title() for i in wanted_ids if names.get(i)))
+        return f"Nothing outstanding for {said or who.strip()}."
     return f"{len(pending)} to do: " + ", ".join(pending) + "."
 
 
