@@ -6,10 +6,17 @@ cloud agent is the MCP client; this server does the HTTP work against
 Skylight's unofficial API. Pebble never talks to Skylight directly, and
 Skylight never sees your Pebble account.
 
-The only tool exposed is `create_event` (write-only — Pebble doesn't need to
-read the calendar back, and cutting `list_events` kept the tool surface
-unambiguous). It can auto-tag a default family member profile and understands
-"me"/"myself" as that person, or any other member by name.
+Two calendar tools are exposed. `create_event` adds an event; it can auto-tag
+a default family member profile and understands "me"/"myself" as that person,
+or any other member by name. `list_events` reads the calendar back —
+`list_events()` with no arguments answers "what's on today", `days` widens the
+window and `who` narrows it to one person — and returns a spoken-style summary
+rather than JSON.
+
+Reading was deliberately left out of the original build (Pebble only needed to
+write, and one tool kept the surface unambiguous). It was added once an
+always-on Claude Code agent started sharing this server and needed to answer
+"what's on my calendar today".
 
 Transport: **Streamable HTTP**. Auth: a static bearer token in the
 `Authorization` header (Pebble doesn't support OAuth login flows for custom
@@ -67,6 +74,8 @@ In the Inspector UI:
 3. Under Authentication, add header `Authorization: Bearer <your MCP_BEARER_TOKEN>`
 4. Connect, then call `create_event` with a test title and check it landed
    on the right profile in the Skylight app.
+5. Call `list_events` with no arguments — the event you just created should
+   come back in the summary, tagged to the same profile.
 
 ## Deploying to Railway
 
@@ -193,9 +202,31 @@ assumptions pulled from a Dec-2025 OpenAPI capture:
   payload; category ids come from `GET .../categories` and are cached per
   process.
 
+Further findings from live-testing the **read** side on 2026-09-01, while
+adding `list_events`:
+
+- `date_min`/`date_max` match on each event's **UTC** date, not its local
+  one. A 7pm Central event is stored at 00:00Z the next day and is returned
+  only by the *following* day's window — so querying "today" unpadded
+  silently drops the whole evening. `list_events` asks for a day either side
+  and narrows to the local window itself.
+- All-day events read back pinned to **UTC midnight** (`2026-09-01T00:00:00
+  .000Z`) whatever offset they were written with — Skylight normalizes them
+  to bare dates. Converting one to local time moves it a day earlier, so
+  `list_events` takes all-day dates straight off the UTC timestamp and only
+  converts timed events.
+- Recurring events are **expanded server-side** into one row per occurrence,
+  each with a composite `{master_id}-{epoch}` id, so no client-side RRULE
+  expansion is needed. `rrule` is an *array* of iCalendar lines on write
+  (`["RRULE:FREQ=WEEKLY;COUNT=4"]`); a bare string is a 422.
+- The category relationship on an event is `category` (a single object) on a
+  plain read, but becomes `categories` (an array) if `include=categories` is
+  passed. Category records come back under `included` either way, so
+  `list_events` resolves member names without a second request.
+
 If Skylight changes its API again, these are the places most likely to
 break: `_login()` (the OAuth steps) and the `calendar_events` payload shape
-in `create_event`.
+in `create_event`/`list_events`.
 
 ## Troubleshooting
 

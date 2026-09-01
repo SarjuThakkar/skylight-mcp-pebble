@@ -45,7 +45,7 @@ import os
 import re
 import time
 import uuid
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from zoneinfo import ZoneInfo
 
 logging.basicConfig(level=logging.INFO)
@@ -299,6 +299,36 @@ def _to_utc_z(dt: datetime) -> str:
     return dt.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.000Z")
 
 
+def _flat(item: dict) -> dict:
+    """JSON:API record -> plain dict of attributes plus its id."""
+    out = dict(item.get("attributes") or {})
+    out["id"] = item.get("id")
+    return out
+
+
+def _fmt_clock(dt: datetime) -> str:
+    """A local time as speech would say it: "8 AM", "1:05 PM"."""
+    return dt.strftime("%I:%M %p").lstrip("0").replace(":00 ", " ")
+
+
+def _join_names(names: list[str]) -> str:
+    """"Sarju", "Maitree and Sarju", "A, B and C" -- read aloud, not printed."""
+    if len(names) < 2:
+        return "".join(names)
+    return f"{', '.join(names[:-1])} and {names[-1]}"
+
+
+def _fmt_day(day: date, today: date) -> str:
+    """A day as speech would say it, relative to today where that's natural."""
+    if day == today:
+        return "today"
+    if day == today + timedelta(days=1):
+        return "tomorrow"
+    if today < day < today + timedelta(days=7):
+        return day.strftime("%A")
+    return f"{day:%A} {day:%B} {day.day}"
+
+
 _category_cache: dict[str, str] | None = None
 
 
@@ -497,6 +527,179 @@ create_event.__doc__ = create_event.__doc__.format(tz=str(LOCAL_TZ))
 mcp.tool()(create_event)
 
 
+def _event_category_ids(row: dict) -> list[str]:
+    """Family-member category ids attached to a calendar event.
+
+    The relationship is `category` (one object) on a plain read, but becomes
+    `categories` (an array) the moment `include=categories` is passed, so
+    both shapes are accepted rather than relying on which query was sent.
+    """
+    rel = row.get("relationships") or {}
+    ids = []
+    for key in ("category", "categories"):
+        data = (rel.get(key) or {}).get("data")
+        if isinstance(data, dict):
+            data = [data]
+        for entry in data or []:
+            if entry.get("id"):
+                ids.append(str(entry["id"]))
+    return ids
+
+
+def _event_span(attrs: dict) -> tuple[date, date, datetime | None]:
+    """(first day, last day, local start) for an event, all in local terms.
+
+    All-day events read back pinned to UTC midnight -- Skylight normalizes
+    them to bare dates regardless of the offset they were written with, so
+    an all-day event on the 1st is `2026-09-01T00:00:00.000Z`. Converting
+    that to LOCAL_TZ would move every all-day event a day earlier, so their
+    dates are taken straight off the UTC timestamp. Timed events are real
+    instants and are converted.
+
+    The last day is inclusive here: `ends_at` is an EXCLUSIVE boundary for
+    all-day events, the same way `date_max` is on the query side.
+    """
+    start = datetime.fromisoformat(attrs["starts_at"])
+    if not attrs.get("all_day"):
+        local = start.astimezone(LOCAL_TZ)
+        return local.date(), local.date(), local
+    first = start.astimezone(timezone.utc).date()
+    ends_at = attrs.get("ends_at")
+    last = first
+    if ends_at:
+        last = datetime.fromisoformat(ends_at).astimezone(timezone.utc).date() - timedelta(days=1)
+    return first, max(first, last), None
+
+
+def _describe_event(ev: dict, today: date, show_owner: bool) -> str:
+    """One event as a phrase a voice assistant can read out."""
+    text = ev["summary"]
+    if ev["all_day"]:
+        text += ", all day"
+        if ev["last"] > ev["day"]:
+            text += f" through {_fmt_day(ev['last'], today)}"
+    else:
+        text += f" at {_fmt_clock(ev['start'])}"
+    if ev["location"]:
+        text += f", at {ev['location']}"
+    if show_owner and ev["owner"]:
+        text += f" ({ev['owner']})"
+    return text
+
+
+@mcp.tool
+async def list_events(days: int = 1, who: str = "") -> str:
+    """Report what's on the family calendar.
+
+    Use this for "what's on my calendar today", "what have we got on
+    tomorrow", or "what's on this week".
+
+    Args:
+        days: How many days ahead to look, counting today. Defaults to
+            today only. Pass 2 for today and tomorrow, 7 for the week.
+        who: Whose events to report, e.g. "Maitree". Say "me"/"my" for the
+            default family member, "us" for everyone. Leave empty for the
+            whole calendar.
+    """
+    logger.info("list_events: days=%r who=%r", days, who)
+    span = max(1, days)
+    today = datetime.now(LOCAL_TZ).date()
+    final_day = today + timedelta(days=span - 1)
+
+    names: dict[str, str] = {}
+    wanted_ids: list[str] = []
+    try:
+        if who.strip():
+            wanted_ids, unmatched = await _resolve_who(who.strip())
+            if unmatched:
+                return f"I don't know who {', '.join(unmatched)} is."
+            names = {v: k for k, v in (await _category_map()).items()}
+        # date_min/date_max filter on each event's UTC date, not its local
+        # one, so a 7pm Central event files under the FOLLOWING day and an
+        # unpadded window silently drops it. Ask for a day either side and
+        # narrow to the real local window below.
+        data = await _request(
+            "GET",
+            f"/frames/{FRAME_ID}/calendar_events",
+            params={
+                "date_min": (today - timedelta(days=1)).isoformat(),
+                "date_max": (final_day + timedelta(days=2)).isoformat(),
+            },
+        )
+    except SkylightError as err:
+        return str(err)
+
+    # Category labels ride along in `included` on every read, so who an event
+    # is tagged to costs no extra request.
+    for inc in data.get("included", []):
+        if inc.get("type") == "category":
+            label = (inc.get("attributes") or {}).get("label")
+            if label:
+                names[str(inc.get("id"))] = label.lower()
+
+    events = []
+    for row in data.get("data", []):
+        attrs = _flat(row)
+        if not attrs.get("starts_at"):
+            continue
+        try:
+            first, last, start_local = _event_span(attrs)
+        except ValueError:
+            logger.warning("list_events: skipping event %r -- unparseable dates", attrs.get("id"))
+            continue
+        if last < today or first > final_day:
+            continue
+        cat_ids = _event_category_ids(row)
+        if wanted_ids and not any(c in wanted_ids for c in cat_ids):
+            continue
+        events.append({
+            # A multi-day event already under way is reported on the first
+            # day the caller actually asked about, not its original start.
+            "day": max(first, today),
+            "last": last,
+            "all_day": bool(attrs.get("all_day")),
+            "start": start_local,
+            "summary": attrs.get("summary") or "something",
+            "location": (attrs.get("location") or "").strip(),
+            "owner": _join_names([names[c].title() for c in cat_ids if names.get(c)]),
+        })
+
+    said = _join_names(sorted(
+        {names[i].title() for i in wanted_ids if names.get(i)}
+    )) or who.strip()
+
+    if not events:
+        when = "today" if span == 1 else f"in the next {span} days"
+        if said:
+            return f"Nothing on {said}'s calendar {when}."
+        return f"Nothing on the calendar {when}."
+
+    # All-day events first within a day, then by clock time.
+    events.sort(key=lambda e: (
+        e["day"],
+        0 if e["all_day"] else 1,
+        -1 if e["start"] is None else e["start"].hour * 60 + e["start"].minute,
+    ))
+
+    show_owner = not who.strip()
+    chunks = []
+    for day in sorted({e["day"] for e in events}):
+        listed = ", ".join(
+            _describe_event(e, today, show_owner) for e in events if e["day"] == day
+        )
+        if span == 1:
+            chunks.append(listed)
+        else:
+            label = _fmt_day(day, today)
+            chunks.append(f"{label[0].upper()}{label[1:]}: {listed}")
+
+    if span == 1:
+        return f"Today{f' for {said}' if said else ''}: {chunks[0]}."
+    count = len(events)
+    header = f"{count} event{'s' if count != 1 else ''}"
+    return f"{header}{f' for {said}' if said else ''}. " + ". ".join(chunks) + "."
+
+
 # ---------------------------------------------------------------------------
 # Lists, chores, rewards and meals
 #
@@ -509,13 +712,6 @@ mcp.tool()(create_event)
 #     blank".
 #   * List items live under their parent list as `list_items`, not `items`.
 # ---------------------------------------------------------------------------
-
-def _flat(item: dict) -> dict:
-    """JSON:API record -> plain dict of attributes plus its id."""
-    out = dict(item.get("attributes") or {})
-    out["id"] = item.get("id")
-    return out
-
 
 def _pick(spoken: str, options: dict[str, str], what: str) -> str:
     """Match spoken text against {label: id}, fuzzily. Raises if no match."""
