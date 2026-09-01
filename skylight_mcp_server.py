@@ -804,6 +804,46 @@ async def show_list(name: str = "") -> str:
     )
 
 
+# How many words either side of an "and" may have before we stop believing it
+# separates two items. "eggs and bread" is a list; "a physical and mental
+# therapist" is one thing being described.
+_AND_MAX_WORDS = 2
+
+
+def _split_items(text: str) -> list[str]:
+    """Split spoken text into separate list-item labels.
+
+    Commas always separate. "and" only sometimes does, and getting that wrong
+    is expensive: splitting on every "and" filed "Find Maitree a physical and
+    mental therapist" as two half-sentences on the frame -- and add_to_list
+    still returned success, so nobody noticed until the frame was read back.
+
+    So "and" (or "&") splits only when the phrase around it reads like a list
+    of things rather than a sentence about one thing: every piece it would
+    produce has to be at most _AND_MAX_WORDS words. "milk, eggs and bread" ->
+    three; "orange juice and paper towels" -> two; "Find Maitree a physical
+    and mental therapist" stays whole. The rule is deliberately biased toward
+    keeping a phrase intact -- one over-long item is visible on the frame and
+    trivial to fix, a silently bisected one is not.
+
+    A trailing Oxford "and" after a comma ("milk, eggs, and bread") is just a
+    comma and is normalised away first.
+    """
+    text = re.sub(r",\s*(?:and|&)\s+", ", ", text, flags=re.IGNORECASE)
+    out = []
+    for chunk in text.split(","):
+        chunk = chunk.strip()
+        if not chunk:
+            continue
+        parts = [p.strip() for p in re.split(r"\band\b|&", chunk, flags=re.IGNORECASE)]
+        parts = [p for p in parts if p]
+        if len(parts) > 1 and all(len(p.split()) <= _AND_MAX_WORDS for p in parts):
+            out.extend(parts)
+        else:
+            out.append(chunk)
+    return out
+
+
 @mcp.tool
 async def add_to_list(items: str, name: str = "") -> str:
     """Add one or more items to a household list.
@@ -814,12 +854,14 @@ async def add_to_list(items: str, name: str = "") -> str:
 
     Args:
         items: What to add, as the user said it. Several at once is fine --
-            "milk, eggs and bread" adds three separate items.
+            "milk, eggs and bread" adds three separate items. Separate
+            anything longer than a couple of words with commas, so a phrase
+            like "a physical and mental therapist" stays one item.
         name: Which list. Leave empty for the grocery list, which is what
             "add milk" almost always means.
     """
     logger.info("add_to_list: items=%r name=%r", items, name)
-    wanted = [i.strip() for i in re.split(r",|&|\band\b", items, flags=re.IGNORECASE) if i.strip()]
+    wanted = _split_items(items)
     if not wanted:
         return "What should I add?"
     try:
@@ -863,6 +905,44 @@ async def check_off_list_item(item: str, name: str = "") -> str:
     except SkylightError as err:
         return str(err)
     return f"Checked off {item.strip()}."
+
+
+@mcp.tool
+async def delete_list_item(item: str, name: str = "") -> str:
+    """Remove an item from a list entirely.
+
+    This is for things that should never have been on the list -- a mishearing,
+    a duplicate, something added by mistake. If the user has actually DONE the
+    thing, check_off_list_item is what they mean: it keeps the item and its
+    history. Deleting is permanent and the frame keeps no record of it.
+
+    Matches completed items as well as open ones, since cleaning up litter is
+    the point.
+
+    Args:
+        item: Which item, as the user said it.
+        name: Which list. Leave empty for the grocery list.
+    """
+    logger.info("delete_list_item: item=%r name=%r", item, name)
+    try:
+        lst = await _resolve_list(name)
+        data = await _request(
+            "GET", f"/frames/{FRAME_ID}/lists/{lst['id']}/list_items"
+        )
+        rows = [_flat(i) for i in data.get("data", [])]
+        by_label = {r["label"].lower(): r["id"] for r in rows if r.get("label")}
+        if not by_label:
+            return f"The {lst.get('label')} is already empty."
+        item_id = _pick(item, by_label, f"item on the {lst.get('label')}")
+        label = next(
+            (r["label"] for r in rows if r["id"] == item_id), item.strip()
+        )
+        await _request(
+            "DELETE", f"/frames/{FRAME_ID}/lists/{lst['id']}/list_items/{item_id}"
+        )
+    except SkylightError as err:
+        return str(err)
+    return f"Deleted {label} from the {lst.get('label')}."
 
 
 # The frame requires a colour on every list -- a create without one comes back
