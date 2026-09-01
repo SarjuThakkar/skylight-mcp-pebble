@@ -315,7 +315,14 @@ async def _category_map() -> dict[str, str]:
     return _category_cache
 
 
-_SELF_ALIASES = {"me", "myself", "i"}
+_SELF_ALIASES = {"me", "myself", "i", "my", "mine", "for me", "my own"}
+
+# Words meaning "everyone on the frame". Resolved to every family member, so
+# "check off our workout" or "did us both" hits each person's copy.
+_EVERYONE_ALIASES = {
+    "us", "we", "both", "everyone", "everybody", "all", "all of us",
+    "both of us", "the family", "family", "our", "ours", "each of us",
+}
 
 
 async def _resolve_who(who: str) -> tuple[list[str], list[str]]:
@@ -327,8 +334,13 @@ async def _resolve_who(who: str) -> tuple[list[str], list[str]]:
     Pebble's speech-to-text can mangle less common names (e.g. "Metree" ->
     "Maitree"). Returns (matched_category_ids, unmatched_names).
     """
-    names = [n.strip() for n in re.split(r",|&|\band\b", who, flags=re.IGNORECASE) if n.strip()]
     mapping = await _category_map()
+
+    # "us"/"we"/"both" means the whole household, not a name to look up.
+    if re.sub(r"[^a-z ]", "", who.lower()).strip() in _EVERYONE_ALIASES:
+        return list(mapping.values()), []
+
+    names = [n.strip() for n in re.split(r",|&|\band\b", who, flags=re.IGNORECASE) if n.strip()]
     matched, unmatched = [], []
     for name in names:
         if name.lower() in _SELF_ALIASES and DEFAULT_MEMBER:
@@ -688,6 +700,25 @@ def _norm_chore(text: str) -> str:
     return re.sub(r"[^a-z0-9]", "", text.lower())
 
 
+def _split_owner(chore: str) -> tuple[str, str]:
+    """Pull a possessive owner out of a chore phrase.
+
+    "my workout" -> ("workout", "my"), "maitree's dishes" -> ("dishes",
+    "maitree"), "our workout" -> ("workout", "our"). The ring often folds the
+    person into the chore rather than passing them separately, and matching
+    "myworkout" against "workout" would simply fail.
+    """
+    text = chore.strip()
+    m = re.match(r"^(?P<owner>[A-Za-z]+)'s\s+(?P<rest>.+)$", text)
+    if m:
+        return m.group("rest").strip(), m.group("owner")
+    m = re.match(r"^(?P<owner>my|mine|our|ours|the|a)\s+(?P<rest>.+)$", text, re.IGNORECASE)
+    if m:
+        owner = m.group("owner").lower()
+        return m.group("rest").strip(), ("" if owner in {"the", "a"} else owner)
+    return text, ""
+
+
 def _norm_kind(kind: str) -> str:
     k = re.sub(r"[^a-z]", "", kind.lower())
     if k in {"shopping", "grocery", "groceries", "store"}:
@@ -717,7 +748,7 @@ async def list_chores(who: str = "", days: int = 1) -> str:
         rows = data.get("data", [])
         wanted_ids: list[str] = []
         if who.strip():
-            wanted_ids, unmatched = await _resolve_who(who)
+            wanted_ids, unmatched = await _resolve_who(who.strip())
             if unmatched:
                 return f"I don't know who {', '.join(unmatched)} is."
         names = {v: k for k, v in (await _category_map()).items()}
@@ -760,6 +791,9 @@ async def complete_chore(chore: str, who: str = "") -> str:
     question rather than picking one.
     """
     logger.info("complete_chore: chore=%r who=%r", chore, who)
+    # "my workout" / "maitree's dishes" fold the person into the chore name.
+    chore, implied = _split_owner(chore)
+    who = who.strip() or implied
     today = datetime.now(LOCAL_TZ).date()
     start = datetime.now(LOCAL_TZ).replace(hour=0, minute=0, second=0, microsecond=0)
     end = start + timedelta(days=1)
@@ -805,15 +839,17 @@ async def complete_chore(chore: str, who: str = "") -> str:
                 f"Today's: {', '.join(sorted({r.get('summary', '') for r in rows}))}."
             )
 
-        if len(matches) > 1:
-            wanted = who.strip() or DEFAULT_MEMBER
-            if wanted:
-                ids, unmatched = await _resolve_who(wanted)
-                if unmatched:
-                    return f"I don't know who {', '.join(unmatched)} is."
-                narrowed = [r for r in matches if r["_category_id"] in ids]
-                if narrowed:
-                    matches = narrowed
+        # Narrow by person. An unqualified request means the default member,
+        # not "whoever sorts first" -- picking wrong writes to someone else's
+        # chore history and moves their points.
+        wanted = who or DEFAULT_MEMBER
+        if len(matches) > 1 and wanted:
+            ids, unmatched = await _resolve_who(wanted)
+            if unmatched:
+                return f"I don't know who {', '.join(unmatched)} is."
+            narrowed = [r for r in matches if r["_category_id"] in ids]
+            if narrowed:
+                matches = narrowed
         if len(matches) > 1:
             owners = ", ".join(sorted(r["_owner"].title() for r in matches if r["_owner"]))
             return (
@@ -821,27 +857,34 @@ async def complete_chore(chore: str, who: str = "") -> str:
                 f"({owners}). Whose should I check off?"
             )
 
-        row = matches[0]
-        body: dict = {"status": "complete", "instance_date": row.get("start")}
-        if row.get("start_time"):
-            body["instance_time"] = row["start_time"]
-        # category_id is only accepted for an up-for-grabs chore; sending it
-        # for a normally assigned one is a 422.
-        if row.get("up_for_grabs") and row.get("_category_id"):
-            body["category_id"] = row["_category_id"]
-
-        await _request(
-            "PUT",
-            f"/frames/{FRAME_ID}/chores/{row.get('series') or row['id']}/completions",
-            json=body,
-        )
+        # "us"/"we" legitimately resolves to several people, so completing more
+        # than one is expected rather than ambiguous.
+        done = []
+        for row in matches:
+            body: dict = {"status": "complete", "instance_date": row.get("start")}
+            if row.get("start_time"):
+                body["instance_time"] = row["start_time"]
+            # category_id is only accepted for an up-for-grabs chore; sending
+            # it for a normally assigned one is a 422.
+            if row.get("up_for_grabs") and row.get("_category_id"):
+                body["category_id"] = row["_category_id"]
+            await _request(
+                "PUT",
+                f"/frames/{FRAME_ID}/chores/{row.get('series') or row['id']}/completions",
+                json=body,
+            )
+            done.append(row)
     except SkylightError as err:
         return str(err)
 
-    points = row.get("reward_points")
+    summary = done[0].get("summary")
+    points = sum(r.get("reward_points") or 0 for r in done)
     earned = f" That's {points} point{'s' if points != 1 else ''}." if points else ""
-    owner = f" for {row['_owner'].title()}" if row.get("_owner") else ""
-    return f"Marked {row.get('summary')} done{owner} for today.{earned}"
+    owners = [r["_owner"].title() for r in done if r.get("_owner")]
+    if len(done) > 1:
+        return f"Marked {summary} done for {' and '.join(owners)} for today.{earned}"
+    owner = f" for {owners[0]}" if owners else ""
+    return f"Marked {summary} done{owner} for today.{earned}"
 
 
 @mcp.tool
