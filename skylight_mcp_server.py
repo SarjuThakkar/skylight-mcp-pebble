@@ -684,6 +684,10 @@ async def create_list(name: str, kind: str = "to_do") -> str:
     return f"Created the {name.strip()} list."
 
 
+def _norm_chore(text: str) -> str:
+    return re.sub(r"[^a-z0-9]", "", text.lower())
+
+
 def _norm_kind(kind: str) -> str:
     k = re.sub(r"[^a-z]", "", kind.lower())
     if k in {"shopping", "grocery", "groceries", "store"}:
@@ -720,10 +724,16 @@ async def list_chores(who: str = "", days: int = 1) -> str:
     except SkylightError as err:
         return str(err)
 
+    cutoff = (start + timedelta(days=max(1, days))).date()
     pending = []
     for row in rows:
         a = _flat(row)
         if a.get("status") == "complete":
+            continue
+        # The API's window is inclusive of the day after `before`, so without
+        # this every chore appeared twice -- today's and tomorrow's, listed
+        # identically with nothing to tell them apart.
+        if a.get("start") and a["start"] >= cutoff.isoformat():
             continue
         cat = ((row.get("relationships", {}).get("category") or {}).get("data") or {})
         cat_id = cat.get("id")
@@ -739,17 +749,18 @@ async def list_chores(who: str = "", days: int = 1) -> str:
 
 @mcp.tool
 async def complete_chore(chore: str, who: str = "") -> str:
-    """Mark a chore done.
+    """Mark today's chore done.
 
     Args:
         chore: Which chore, as the user said it, e.g. "workout".
-        who: Only needed for a chore that's up for grabs rather than assigned
-            to someone. Leave empty otherwise.
+        who: Whose chore, when more than one person has the same one today.
+            Leave empty to use the default family member.
 
-    IMPORTANT: if the result says the chore wasn't found, relay the list of
-    real chore names rather than guessing at a different one.
+    IMPORTANT: if the result asks which person's chore is meant, relay that
+    question rather than picking one.
     """
     logger.info("complete_chore: chore=%r who=%r", chore, who)
+    today = datetime.now(LOCAL_TZ).date()
     start = datetime.now(LOCAL_TZ).replace(hour=0, minute=0, second=0, microsecond=0)
     end = start + timedelta(days=1)
     try:
@@ -758,39 +769,79 @@ async def complete_chore(chore: str, who: str = "") -> str:
             f"/frames/{FRAME_ID}/chores"
             f"?after={_to_utc_z(start)}&before={_to_utc_z(end)}",
         )
-        rows = [_flat(r) for r in data.get("data", [])]
-        open_rows = {
-            r["summary"].lower(): r
-            for r in rows if r.get("summary") and r.get("status") != "complete"
-        }
-        if not open_rows:
-            return "Nothing's outstanding today."
-        picked_id = _pick(chore, {k: v["id"] for k, v in open_rows.items()}, "chore")
-        row = next(r for r in open_rows.values() if r["id"] == picked_id)
+        names = {v: k for k, v in (await _category_map()).items()}
 
-        # The completion goes against the *series*, with the occurrence named
-        # separately -- posting the occurrence id would complete the whole
-        # recurring series instead of today's instance.
+        # Keep every row. Keying a dict by chore name collapsed the four
+        # daily Workouts -- two people over two days -- into one entry, and
+        # the last silently won: tomorrow's, for the wrong person.
+        rows = []
+        for row in data.get("data", []):
+            a = _flat(row)
+            if a.get("status") == "complete":
+                continue
+            # The API's window is inclusive of the following day, so an
+            # explicit date check is what actually confines this to today.
+            if a.get("start") != today.isoformat():
+                continue
+            cat = ((row.get("relationships", {}).get("category") or {}).get("data") or {})
+            a["_category_id"] = cat.get("id")
+            a["_owner"] = names.get(cat.get("id"), "")
+            rows.append(a)
+
+        if not rows:
+            return "Nothing's outstanding today."
+
+        key = _norm_chore(chore)
+        matches = [r for r in rows if _norm_chore(r.get("summary", "")) == key]
+        if not matches:
+            close = difflib.get_close_matches(
+                key, [_norm_chore(r.get("summary", "")) for r in rows], n=1, cutoff=0.6
+            )
+            if close:
+                matches = [r for r in rows if _norm_chore(r.get("summary", "")) == close[0]]
+        if not matches:
+            return (
+                f"I don't have a chore called '{chore.strip()}' outstanding today. "
+                f"Today's: {', '.join(sorted({r.get('summary', '') for r in rows}))}."
+            )
+
+        if len(matches) > 1:
+            wanted = who.strip() or DEFAULT_MEMBER
+            if wanted:
+                ids, unmatched = await _resolve_who(wanted)
+                if unmatched:
+                    return f"I don't know who {', '.join(unmatched)} is."
+                narrowed = [r for r in matches if r["_category_id"] in ids]
+                if narrowed:
+                    matches = narrowed
+        if len(matches) > 1:
+            owners = ", ".join(sorted(r["_owner"].title() for r in matches if r["_owner"]))
+            return (
+                f"{matches[0].get('summary')} is on more than one person's list today "
+                f"({owners}). Whose should I check off?"
+            )
+
+        row = matches[0]
         body: dict = {"status": "complete", "instance_date": row.get("start")}
         if row.get("start_time"):
             body["instance_time"] = row["start_time"]
         # category_id is only accepted for an up-for-grabs chore; sending it
         # for a normally assigned one is a 422.
-        if who.strip() and row.get("up_for_grabs"):
-            matched, unmatched = await _resolve_who(who)
-            if unmatched:
-                return f"I don't know who {', '.join(unmatched)} is."
-            body["category_id"] = matched[0]
+        if row.get("up_for_grabs") and row.get("_category_id"):
+            body["category_id"] = row["_category_id"]
 
         await _request(
-            "PUT", f"/frames/{FRAME_ID}/chores/{row.get('series') or row['id']}/completions",
+            "PUT",
+            f"/frames/{FRAME_ID}/chores/{row.get('series') or row['id']}/completions",
             json=body,
         )
     except SkylightError as err:
         return str(err)
+
     points = row.get("reward_points")
     earned = f" That's {points} point{'s' if points != 1 else ''}." if points else ""
-    return f"Marked {row.get('summary')} done.{earned}"
+    owner = f" for {row['_owner'].title()}" if row.get("_owner") else ""
+    return f"Marked {row.get('summary')} done{owner} for today.{earned}"
 
 
 @mcp.tool
