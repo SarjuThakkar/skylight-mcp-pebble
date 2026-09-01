@@ -24,6 +24,12 @@ Auth, live-verified 2026-08-26 against a real account:
     2. POST /auth/session          -> credentials, redeems the cookie
     3. GET  /oauth/authorize       -> redirects to redirect_uri?code=...
     4. POST /oauth/token           -> code -> {access_token, refresh_token}
+  As of 2026-09-01 step 3 REQUIRES PKCE: without code_challenge +
+  code_challenge_method it returns `400 Code challenge is required.`, and
+  the matching code_verifier must be sent at step 4. This was optional when
+  the flow was first mapped, which is the standing hazard of an unofficial
+  API -- it changed with no notice.
+
   The resulting access_token is sent as `Authorization: Bearer <token>` on
   every API call, alongside `skylight-api-version: 2026-05-01` (confirmed
   live; the API 422s some endpoints without it). On a 401, re-run the login
@@ -32,6 +38,8 @@ Auth, live-verified 2026-08-26 against a real account:
 
 import base64
 import difflib
+import hashlib
+import secrets
 import logging
 import os
 import re
@@ -89,12 +97,26 @@ class SkylightError(RuntimeError):
     """Raised for login failures and non-2xx Skylight API responses."""
 
 
+def _pkce_pair() -> tuple[str, str]:
+    """Return (code_verifier, code_challenge) for PKCE S256.
+
+    Skylight began rejecting the plain authorization-code flow with
+    `400 Code challenge is required.` -- PKCE used to be optional here and
+    is now mandatory. Both values are per-login and never reused.
+    """
+    verifier = secrets.token_urlsafe(64)[:96]
+    digest = hashlib.sha256(verifier.encode("ascii")).digest()
+    challenge = base64.urlsafe_b64encode(digest).decode("ascii").rstrip("=")
+    return verifier, challenge
+
+
 async def _login() -> str:
     """Run the 4-step OAuth2 authorization-code exchange, return an access token.
 
     Never logs or echoes the password. Cookies must persist across all 4
     requests, so this uses a single client for the whole flow.
     """
+    verifier, challenge = _pkce_pair()
     async with httpx.AsyncClient(base_url=BASE, timeout=20, follow_redirects=False) as client:
         # Step 1: CSRF token + session cookie.
         r = await client.get("/auth/session/new", headers={"User-Agent": USER_AGENT})
@@ -126,9 +148,17 @@ async def _login() -> str:
 
         # Step 3: exchange the session for an authorization code. Follow
         # redirects manually, scanning each Location for ?code=.
-        authorize_url = (
-            f"{BASE}/oauth/authorize?client_id={CLIENT_ID}&response_type=code"
-            f"&scope={SCOPE}&redirect_uri={httpx.QueryParams({'u': REDIRECT_URI})['u']}"
+        authorize_url = f"{BASE}/oauth/authorize?" + str(
+            httpx.QueryParams(
+                {
+                    "client_id": CLIENT_ID,
+                    "response_type": "code",
+                    "scope": SCOPE,
+                    "redirect_uri": REDIRECT_URI,
+                    "code_challenge": challenge,
+                    "code_challenge_method": "S256",
+                }
+            )
         )
         code = None
         next_url = authorize_url
@@ -153,6 +183,8 @@ async def _login() -> str:
                 "scope": SCOPE,
                 "redirect_uri": REDIRECT_URI,
                 "code": code,
+                # Proves this is the same client that started the flow.
+                "code_verifier": verifier,
                 "skylight_api_client_device_fingerprint": str(uuid.uuid4()),
                 "skylight_api_client_device_platform": "web",
                 "skylight_api_client_device_name": "unknown",
