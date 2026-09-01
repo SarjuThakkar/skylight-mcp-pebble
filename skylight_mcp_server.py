@@ -1201,6 +1201,116 @@ async def complete_chore(chore: str, who: str = "") -> str:
     return f"Marked {summary} done{owner} for today.{earned}"
 
 
+# How often a chore comes back. The API takes a full RRULE set, the same shape
+# calendar events use, but chores only ever need a plain repeat -- so spoken
+# words map to a fixed rule here rather than being parsed into one.
+_CHORE_RRULES = {
+    "daily": "RRULE:FREQ=DAILY;INTERVAL=1",
+    "weekly": "RRULE:FREQ=WEEKLY;INTERVAL=1",
+    "monthly": "RRULE:FREQ=MONTHLY;INTERVAL=1",
+    "once": "",
+}
+
+_FREQ_ALIASES = {
+    "everyday": "daily", "day": "daily", "eachday": "daily",
+    "week": "weekly", "everyweek": "weekly", "eachweek": "weekly",
+    "month": "monthly", "everymonth": "monthly", "eachmonth": "monthly",
+    "onetime": "once", "oneoff": "once", "never": "once", "": "daily",
+}
+
+
+def _norm_frequency(freq: str) -> str:
+    key = re.sub(r"[^a-z]", "", freq.lower())
+    key = _FREQ_ALIASES.get(key, key)
+    return key
+
+
+def _parse_reward(reward: str) -> int:
+    """Points out of spoken text: "2", "2 points", "none", "" -> 2, 2, 0, 0."""
+    m = re.search(r"\d+", reward or "")
+    return int(m.group()) if m else 0
+
+
+@mcp.tool
+async def create_chore(
+    name: str,
+    frequency: str = "daily",
+    who: str = "",
+    reward: str = "",
+) -> str:
+    """Add a new chore to the chore chart.
+
+    Creates the recurring chore itself, not a one-off reminder. Use
+    complete_chore to tick off an existing one.
+
+    Args:
+        name: What the chore is called, e.g. "Read", "Take the bins out".
+        frequency: How often it repeats -- "daily", "weekly", "monthly", or
+            "once" for a chore that doesn't come back. Defaults to daily.
+        who: Whose chore it is. Leave empty for the default family member.
+            "us"/"both" creates a copy for each person, since the chore chart
+            tracks a chore per person rather than sharing one.
+        reward: Points for doing it, e.g. "2". Leave empty for no reward --
+            that is the default, and the API rejects an explicit zero.
+    """
+    logger.info("create_chore: name=%r frequency=%r who=%r reward=%r", name, frequency, who, reward)
+    title = name.strip()
+    if not title:
+        return "I need a name for the chore."
+
+    freq = _norm_frequency(frequency)
+    if freq not in _CHORE_RRULES:
+        return (
+            f"I can repeat a chore daily, weekly or monthly, or make it a one-off "
+            f"-- not '{frequency}'."
+        )
+
+    # A category is mandatory on create (a bare POST is 422 "Category is
+    # required."), so an unassigned chore isn't possible -- fall back to the
+    # default member rather than failing.
+    effective_who = who.strip() or DEFAULT_MEMBER
+    if not effective_who:
+        return "I don't know whose chore this is -- tell me a name."
+    try:
+        matched_ids, unmatched = await _resolve_who(effective_who)
+    except SkylightError as err:
+        return str(err)
+    if unmatched:
+        return f"I don't know who {', '.join(unmatched)} is."
+    if not matched_ids:
+        return f"I couldn't work out whose chore '{title}' is."
+
+    payload: dict = {"summary": title}
+    rrule = _CHORE_RRULES[freq]
+    if rrule:
+        payload["start"] = datetime.now(LOCAL_TZ).date().isoformat()
+        payload["recurrence_set"] = [rrule]
+    points = _parse_reward(reward)
+    if points > 0:
+        # Omitted means no reward; reward_points=0 is a 422 "must be greater
+        # than 0", so the field has to be left out entirely rather than zeroed.
+        payload["reward_points"] = points
+
+    names = {v: k for k, v in (await _category_map()).items()}
+    created = []
+    try:
+        for cat_id in matched_ids:
+            await _request(
+                "POST", f"/frames/{FRAME_ID}/chores",
+                json={**payload, "category_id": cat_id},
+            )
+            created.append(names.get(cat_id, "").title())
+    except SkylightError as err:
+        if created:
+            return f"Added '{title}' for {_join_names(created)}, but then it failed: {err}"
+        return f"Couldn't add '{title}' -- Skylight rejected it: {err}"
+
+    how_often = "one-off" if freq == "once" else freq
+    earned = f" worth {points} point{'s' if points != 1 else ''}" if points else ""
+    owners = _join_names([o for o in created if o])
+    return f"Added '{title}' as a {how_often} chore{earned}" + (f" for {owners}." if owners else ".")
+
+
 async def _point_balances() -> dict[str, int]:
     """category id -> current point balance.
 
